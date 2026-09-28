@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Thumbnails
+.Spotlight-V100
+.Trashes
+
+# WorkBuddy
+.workbuddy/
