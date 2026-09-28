@@ -8,5 +8,8 @@
 .Spotlight-V100
 .Trashes
 
+# Build output (run ./build.sh to regenerate)
+build/
+
 # WorkBuddy
 .workbuddy/
