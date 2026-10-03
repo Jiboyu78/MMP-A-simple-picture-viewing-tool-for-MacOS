@@ -11,6 +11,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
 
     private var window: NSWindow?
     private var titleCancellable: AnyCancellable?
+    private var wheelAccumulator: CGFloat = 0
+    private var lastWheelTime: TimeInterval = 0
 
     // MARK: - Lifecycle
 
@@ -19,6 +21,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
         buildMainMenu()
         makeWindowIfNeeded()   // 冷启动时 application(_:open:) 可能已经抢先建过窗口
         installKeyMonitor()
+        installScrollMonitor()
+        installMagnifyMonitor()
         observeTitle()
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -43,6 +47,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
         model.open(url)
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// 放大后拖拽用于平移图片，此时禁用「拖背景移动窗口」。
+    func setBackgroundMovable(_ movable: Bool) {
+        window?.isMovableByWindowBackground = movable
     }
 
     @objc func openDocument(_ sender: Any?) {
@@ -115,26 +124,99 @@ final class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
     private func installKeyMonitor() {
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self else { return event }
-            let keyCode = event.keyCode
-            let isCommand = event.modifierFlags.contains(.command)
-            let characters = event.charactersIgnoringModifiers
             let handled = MainActor.assumeIsolated {
-                self.handle(keyCode: keyCode, isCommand: isCommand, characters: characters)
+                self.handleKey(event)
             }
             return handled ? nil : event
         }
     }
 
-    private func handle(keyCode: UInt16, isCommand: Bool, characters: String?) -> Bool {
-        if isCommand, characters?.lowercased() == "o" {
-            openDocument(nil)
-            return true
+    private func handleKey(_ event: NSEvent) -> Bool {
+        if event.modifierFlags.contains(.command) {
+            switch event.charactersIgnoringModifiers?.lowercased() {
+            case "o":        openDocument(nil); return true
+            case "=", "+":   model.zoomIn(); return true
+            case "-":        model.zoomOut(); return true
+            case "0":        model.resetZoom(); return true
+            default:         break
+            }
         }
-        switch keyCode {
+        switch event.keyCode {
         case 123: model.goToPrevious(); return true   // ←
         case 124: model.goToNext(); return true       // →
-        case 53:  window?.performClose(nil); return true  // esc
+        case 126: model.zoomIn(); return true         // ↑
+        case 125: model.zoomOut(); return true        // ↓
+        case 49:                                      // 空格：GIF 播放/暂停
+            guard model.isGIF else { return false }
+            model.toggleGIFPlayback()
+            return true
+        case 53:                                      // esc：先退出缩放，再关窗口
+            if model.isZoomed {
+                model.resetZoom()
+            } else {
+                window?.performClose(nil)
+            }
+            return true
         default:  return false
+        }
+    }
+
+    // MARK: - Scroll wheel & trackpad
+
+    /// 光标位置换算成「以视图中心为原点、y 向下」的坐标，供缩放锚点使用。
+    private func cursorPoint(_ event: NSEvent) -> CGPoint {
+        guard let view = window?.contentView else { return .zero }
+        let loc = event.locationInWindow
+        return CGPoint(x: loc.x - view.bounds.midX, y: -(loc.y - view.bounds.midY))
+    }
+
+    private func installScrollMonitor() {
+        NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+            guard let self, event.window === self.window else { return event }
+            // 只响应手指/滚轮的直接滚动，忽略惯性（动量）阶段
+            guard event.momentumPhase == [] else { return event }
+            let handled = MainActor.assumeIsolated {
+                self.handleScroll(event)
+            }
+            return handled ? nil : event
+        }
+    }
+
+    private func handleScroll(_ event: NSEvent) -> Bool {
+        guard model.hasImage else { return false }
+        let dy = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY : event.scrollingDeltaY * 16
+
+        switch model.navigationMode {
+        case .wheelZoom:
+            guard dy != 0 else { return false }
+            model.setZoom(model.zoomScale * exp(dy * 0.008), around: cursorPoint(event))
+            return true
+
+        case .wheelNavigate:
+            // 触控板滚动是连续小量，累积过阈值才翻页；间歇太久则重新累积
+            if event.timestamp - lastWheelTime > 0.6 { wheelAccumulator = 0 }
+            lastWheelTime = event.timestamp
+            wheelAccumulator += dy
+            if abs(wheelAccumulator) >= 60 {
+                let forward = wheelAccumulator < 0   // 向下滚 → 下一张
+                wheelAccumulator = 0
+                forward ? model.goToNext() : model.goToPrevious()
+            }
+            return true
+        }
+    }
+
+    /// 触控板双指捏合缩放（两种模式下都可用）。
+    private func installMagnifyMonitor() {
+        NSEvent.addLocalMonitorForEvents(matching: .magnify) { [weak self] event in
+            guard let self, event.window === self.window else { return event }
+            let handled = MainActor.assumeIsolated {
+                guard self.model.hasImage else { return false }
+                self.model.setZoom(self.model.zoomScale * (1 + event.magnification),
+                                   around: self.cursorPoint(event))
+                return true
+            }
+            return handled ? nil : event
         }
     }
 
@@ -165,8 +247,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
         let navMenu = NSMenu(title: "浏览")
         navMenu.addItem(NSMenuItem(title: "上一张", action: #selector(previousImage(_:)), keyEquivalent: ""))
         navMenu.addItem(NSMenuItem(title: "下一张", action: #selector(nextImage(_:)), keyEquivalent: ""))
+        navMenu.addItem(.separator())
+        navMenu.addItem(NSMenuItem(title: "播放 / 暂停（GIF）", action: #selector(toggleGIF(_:)), keyEquivalent: ""))
+        navMenu.addItem(NSMenuItem(title: "上一帧（GIF）", action: #selector(previousFrame(_:)), keyEquivalent: ""))
+        navMenu.addItem(NSMenuItem(title: "下一帧（GIF）", action: #selector(nextFrame(_:)), keyEquivalent: ""))
         navMenuItem.submenu = navMenu
         mainMenu.addItem(navMenuItem)
+
+        let viewMenuItem = NSMenuItem()
+        let viewMenu = NSMenu(title: "显示")
+        viewMenu.addItem(NSMenuItem(title: "放大", action: #selector(zoomIn(_:)), keyEquivalent: ""))
+        viewMenu.addItem(NSMenuItem(title: "缩小", action: #selector(zoomOut(_:)), keyEquivalent: ""))
+        viewMenu.addItem(NSMenuItem(title: "重置缩放", action: #selector(resetZoom(_:)), keyEquivalent: ""))
+        viewMenuItem.submenu = viewMenu
+        mainMenu.addItem(viewMenuItem)
+
+        let settingsMenuItem = NSMenuItem()
+        let settingsMenu = NSMenu(title: "设置")
+        let modeA = NSMenuItem(title: NavigationMode.wheelZoom.title, action: #selector(selectWheelZoom(_:)), keyEquivalent: "")
+        modeA.target = self
+        let modeB = NSMenuItem(title: NavigationMode.wheelNavigate.title, action: #selector(selectWheelNavigate(_:)), keyEquivalent: "")
+        modeB.target = self
+        settingsMenu.addItem(modeA)
+        settingsMenu.addItem(modeB)
+        settingsMenu.delegate = self
+        settingsMenuItem.submenu = settingsMenu
+        mainMenu.addItem(settingsMenuItem)
 
         NSApp.mainMenu = mainMenu
     }
@@ -174,4 +280,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
     @objc private func previousImage(_ sender: Any?) { model.goToPrevious() }
 
     @objc private func nextImage(_ sender: Any?) { model.goToNext() }
+
+    @objc private func toggleGIF(_ sender: Any?) { model.toggleGIFPlayback() }
+
+    @objc private func previousFrame(_ sender: Any?) { model.stepGIF(by: -1) }
+
+    @objc private func nextFrame(_ sender: Any?) { model.stepGIF(by: 1) }
+
+    @objc private func zoomIn(_ sender: Any?) { model.zoomIn() }
+
+    @objc private func zoomOut(_ sender: Any?) { model.zoomOut() }
+
+    @objc private func resetZoom(_ sender: Any?) { model.resetZoom() }
+
+    @objc private func selectWheelZoom(_ sender: Any?) { model.navigationMode = .wheelZoom }
+
+    @objc private func selectWheelNavigate(_ sender: Any?) { model.navigationMode = .wheelNavigate }
+}
+
+// MARK: - NSMenuDelegate（设置菜单的单选勾选）
+
+extension AppDelegate: NSMenuDelegate {
+    nonisolated func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu.title == "设置" else { return }
+        MainActor.assumeIsolated {
+            for item in menu.items {
+                switch item.action {
+                case #selector(selectWheelZoom(_:)):
+                    item.state = model.navigationMode == .wheelZoom ? .on : .off
+                case #selector(selectWheelNavigate(_:)):
+                    item.state = model.navigationMode == .wheelNavigate ? .on : .off
+                default:
+                    break
+                }
+            }
+        }
+    }
 }
