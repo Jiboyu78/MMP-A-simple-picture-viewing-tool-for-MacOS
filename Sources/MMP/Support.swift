@@ -23,11 +23,17 @@ enum ImageLoading {
 
     static func load(url: URL, maxPixelSize: Int) -> Result {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
-            return Result(nsImage: nil, pixelSize: nil, decodedPixelSize: nil, gifFrames: nil, errorText: "无法读取该文件，可能不是支持的图片格式")
+            // ImageIO 完全不认的文件（如 SVG）：退回 AppKit 渲染
+            return loadViaAppKit(url: url, maxPixelSize: maxPixelSize)
+                ?? Result(nsImage: nil, pixelSize: nil, decodedPixelSize: nil, gifFrames: nil,
+                          errorText: "无法读取该文件，可能不是支持的图片格式")
         }
         let count = CGImageSourceGetCount(source)
         guard count > 0 else {
-            return Result(nsImage: nil, pixelSize: nil, decodedPixelSize: nil, gifFrames: nil, errorText: "文件中没有可显示的图片")
+            // ImageIO 认得类型但没有可解码的帧（矢量格式常见）：同样退回 AppKit
+            return loadViaAppKit(url: url, maxPixelSize: maxPixelSize)
+                ?? Result(nsImage: nil, pixelSize: nil, decodedPixelSize: nil, gifFrames: nil,
+                          errorText: "文件中没有可显示的图片")
         }
 
         let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
@@ -57,6 +63,51 @@ enum ImageLoading {
         return Result(
             nsImage: image,
             pixelSize: pixelSize,
+            decodedPixelSize: CGSize(width: cgImage.width, height: cgImage.height),
+            gifFrames: nil,
+            errorText: nil
+        )
+    }
+
+    /// Fallback for files ImageIO can't rasterize — notably SVG, which AppKit
+    /// renders itself (`_NSSVGImageRep`). The vector is rasterized at the current
+    /// decode budget so it stays crisp when zoomed in.
+    private static func loadViaAppKit(url: URL, maxPixelSize: Int) -> Result? {
+        guard let image = NSImage(contentsOf: url),
+              image.size.width > 0, image.size.height > 0 else { return nil }
+
+        let intrinsic = image.size
+        let scale = CGFloat(maxPixelSize) / max(intrinsic.width, intrinsic.height)
+        let pixelsWide = max(Int((intrinsic.width * scale).rounded()), 1)
+        let pixelsHigh = max(Int((intrinsic.height * scale).rounded()), 1)
+
+        // 用位图上下文精确控制输出像素，避免受屏幕 backing scale 影响
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: pixelsWide,
+            pixelsHigh: pixelsHigh,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ) else { return nil }
+        rep.size = NSSize(width: pixelsWide, height: pixelsHigh)
+
+        NSGraphicsContext.saveGraphicsState()
+        defer { NSGraphicsContext.restoreGraphicsState() }
+        guard let context = NSGraphicsContext(bitmapImageRep: rep) else { return nil }
+        NSGraphicsContext.current = context
+        image.draw(in: NSRect(x: 0, y: 0, width: CGFloat(pixelsWide), height: CGFloat(pixelsHigh)),
+                   from: .zero, operation: .sourceOver, fraction: 1)
+
+        guard let cgImage = rep.cgImage else { return nil }
+
+        return Result(
+            nsImage: NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height)),
+            pixelSize: intrinsic,
             decodedPixelSize: CGSize(width: cgImage.width, height: cgImage.height),
             gifFrames: nil,
             errorText: nil

@@ -39,10 +39,12 @@ enum SelfTest {
             }
             let original = result.pixelSize ?? .zero
             let maxSide = max(original.width, original.height)
-            let expected = min(maxSide, CGFloat(budget))
+            // 矢量图（SVG）按解码预算栅格化，允许超过其固有尺寸，只要不超过预算即可
+            let isVector = url.pathExtension.lowercased() == "svg"
+            let expected = isVector ? CGFloat(budget) : min(maxSide, CGFloat(budget))
             let actual = max(decoded.width, decoded.height)
             let ok = actual <= expected + 1
-            print("  \(ok ? "✅" : "❌") \(name) 原始 \(Int(original.width))×\(Int(original.height))  →  解码 \(Int(decoded.width))×\(Int(decoded.height))")
+            print("  \(ok ? "✅" : "❌") \(name) 原始 \(Int(original.width))×\(Int(original.height))  →  解码 \(Int(decoded.width))×\(Int(decoded.height))\(isVector ? "（矢量栅格化）" : "")")
             if !ok {
                 print("     期望最长边 ≤ \(Int(expected))，实际 \(Int(actual))")
                 failures += 1
